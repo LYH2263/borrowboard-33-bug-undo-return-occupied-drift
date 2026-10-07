@@ -39,3 +39,24 @@ def init_db():
         c.execute("INSERT INTO settings(key,value) VALUES ('board_name','木色邻里板')")
         c.commit()
     c.close()
+
+def reconcile_item_status():
+    """启动对账：修掉旧版本失败路径提交/叠单留下的 items.status 与 loans 不一致。
+    - 同一物若有多笔 active（旧版本借出 TOCTOU 叠单），保留最新一笔，其余收口为
+      cancelled；有 active 笔 item 必为 on_loan；
+    - 无 active 笔 item 必为 available（逾期只在读取时判，不会把 item 留在 on_loan）。"""
+    c = connect()
+    c.execute("BEGIN IMMEDIATE")
+    c.execute(
+        "UPDATE loans SET status='cancelled', rev_conflict='reconciled', "
+        "unreturn_reason=COALESCE(unreturn_reason,'启动对账收口叠单') "
+        "WHERE status='active' AND id NOT IN ("
+        "SELECT MAX(id) FROM loans WHERE status='active' GROUP BY item_id)")
+    c.execute(
+        "UPDATE items SET status='on_loan' WHERE status!='on_loan' AND EXISTS ("
+        "SELECT 1 FROM loans WHERE loans.item_id=items.id AND loans.status='active')")
+    c.execute(
+        "UPDATE items SET status='available' WHERE status='on_loan' AND NOT EXISTS ("
+        "SELECT 1 FROM loans WHERE loans.item_id=items.id AND loans.status='active')")
+    c.commit()
+    c.close()

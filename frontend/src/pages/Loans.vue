@@ -13,13 +13,16 @@
       <div v-if="l.unreturn_reason" class="muted">撤销归还恢复：{{ l.unreturn_reason }}</div>
     </div>
     <h3>已还</h3>
-    <div v-for="(l, idx) in data.returned" :key="'r'+l.id" class="item">
+    <div v-for="l in data.returned" :key="'r'+l.id" class="item">
       <strong>{{ l.title }}</strong> · {{ l.borrower }}
       <div class="muted">应还 {{ l.due_date }} · 已还 {{ fmt(l.returned_at) }}</div>
-      <template v-if="idx === 0">
+      <template v-if="l.id === latestId">
         <input v-model="form.reason" placeholder="撤销原因（必填）" />
-        <div v-if="relent(l)" class="muted warn">
-          该物归还后已被「{{ relent(l).borrower }}」借出，请选择冲突处置：
+        <div v-if="preview && !preview.can_unreturn" class="muted warn">
+          {{ ERR_MSG[preview.reason_code] || '当前不可撤销' }}
+        </div>
+        <div v-else-if="preview && preview.conflict" class="muted warn">
+          该物归还后已被「{{ conflictBorrowers }}」借出，请选择冲突处置：
           <label class="opt"><input type="radio" value="fail" v-model="form.on_conflict" />
             整单失败保持现况</label>
           <label class="opt"><input type="radio" value="bump" v-model="form.on_conflict" />
@@ -39,11 +42,10 @@
   </div>
 </template>
 <script setup>
-import { ref, reactive, inject } from 'vue'
+import { ref, reactive, computed, inject } from 'vue'
 import { api } from '../api'
 const data = ref({ active: [], overdue: [], returned: [], cancelled: [] })
-const driftHint = ref(true)
-const board = inject('board')
+const preview = ref(null)
 const reloadBoard = inject('reloadBoard')
 const form = reactive({ reason: '', on_conflict: 'fail' })
 const error = ref('')
@@ -56,14 +58,24 @@ const ERR_MSG = {
   item_relent: '撤销失败：该物已被别人借出',
 }
 
+// 最近一笔成功归还以后端 returned_at 为准（id 序在撤销/挤掉后不可靠）
+const latestId = computed(() => {
+  const rs = data.value.returned || []
+  if (!rs.length) return null
+  return rs.reduce((a, b) => ((b.returned_at || '') > (a.returned_at || '') ? b : a)).id
+})
+const conflictBorrowers = computed(() =>
+  (preview.value?.active_loans || []).map(x => x.borrower).join('、'))
+
 async function load() {
   data.value = await api('/loans')
+  preview.value = null
+  if (latestId.value != null) {
+    // 只读预览：不写任何集合，不影响可借栏/在借栏/顶细条数字
+    preview.value = await api('/loans/' + latestId.value + '/unreturn/preview')
+  }
 }
 function fmt(ts) { return ts ? ts.replace('T', ' ').slice(0, 16) : '—' }
-function relent(l) {
-  const cur = board.value || {}
-  return [...(cur.overdue || []), ...(cur.active || [])].find(x => x.item_id === l.item_id)
-}
 async function unreturn(l) {
   error.value = ''; notice.value = ''
   try {
@@ -75,10 +87,10 @@ async function unreturn(l) {
     notice.value = r.conflict
       ? `已撤销：原笔回到在借，新借 #${r.bumped_loan_ids.join(', #')} 已被挤掉`
       : '已撤销归还，该笔回到在借栏'
-    await Promise.all([load(), reloadBoard()])
   } catch (e) {
+    // 失败（含缺原因/已被借出 fail）后端整单回滚：仅以服务端权威数据重刷
     error.value = ERR_MSG[e.message] || ('撤销失败：' + e.message)
-    if (e.message === 'item_relent') driftHint.value = true
+  } finally {
     await Promise.all([load(), reloadBoard()])
   }
 }
