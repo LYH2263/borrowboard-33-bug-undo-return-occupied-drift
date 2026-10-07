@@ -1,8 +1,5 @@
 """One active loan per item + overdue detection."""
 
-def unreturn_conflict_codes() -> set:
-    return {"item_relent"}
-
 def can_lend(item_status: str, active_loans: int) -> dict:
     if item_status != "available":
         return {"ok": False, "reason": "item_not_available"}

@@ -3,6 +3,29 @@ from app.db import connect
 def _columns(c, table: str) -> set[str]:
     return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
 
+def _reconcile(c) -> None:
+    """建唯一索引前收口历史漂移：items.status 以是否存在 active loan 为准；
+    一物多条 active（旧故障/并发遗留）只留最新一笔，其余记为 cancelled。"""
+    dupes = c.execute(
+        "SELECT item_id, COUNT(*) c FROM loans WHERE status='active' GROUP BY item_id HAVING c>1"
+    ).fetchall()
+    for d in dupes:
+        c.execute(
+            "UPDATE loans SET status='cancelled', rev_conflict='reconciled' "
+            "WHERE item_id=? AND status='active' AND id NOT IN "
+            "(SELECT MAX(id) FROM loans WHERE item_id=? AND status='active')",
+            (d["item_id"], d["item_id"]))
+    c.execute(
+        "UPDATE items SET status='on_loan' WHERE EXISTS "
+        "(SELECT 1 FROM loans WHERE loans.item_id=items.id AND loans.status='active') "
+        "AND status!='on_loan'"
+    )
+    c.execute(
+        "UPDATE items SET status='available' WHERE NOT EXISTS "
+        "(SELECT 1 FROM loans WHERE loans.item_id=items.id AND loans.status='active') "
+        "AND status!='available'"
+    )
+
 def init_db():
     c = connect()
     c.executescript("""
@@ -38,4 +61,12 @@ def init_db():
         )
         c.execute("INSERT INTO settings(key,value) VALUES ('board_name','木色邻里板')")
         c.commit()
+    # 收口旧故障留下的漂移，再建“一物一在借”部分唯一索引兜底叠单
+    _reconcile(c)
+    c.commit()
+    c.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_loans_one_active "
+        "ON loans(item_id) WHERE status='active'"
+    )
+    c.commit()
     c.close()

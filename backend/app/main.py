@@ -1,4 +1,5 @@
 from datetime import date, datetime, timezone
+from sqlite3 import IntegrityError
 from typing import Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +7,6 @@ from pydantic import BaseModel
 from app import seed
 from app.db import connect
 from app.engines.borrow_rules import can_lend, classify_loans
-from app.engines import unreturn_drift as ud
 
 app = FastAPI(title="Borrowboard", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -55,29 +55,66 @@ class LendIn(BaseModel):
 @app.post("/api/items/{iid}/lend")
 def lend(iid: int, body: LendIn):
     c = connect()
-    item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
-    if not item: c.close(); raise HTTPException(404, "item")
-    active = c.execute("SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'", (iid,)).fetchone()["c"]
-    check = can_lend(item["status"], active)
-    if not check["ok"]:
-        c.close(); raise HTTPException(409, check["reason"])
-    cur = c.execute(
-        "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
-        (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
-    c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-    c.commit(); lid = cur.lastrowid; c.close(); return {"loan_id": lid}
+    try:
+        try:
+            item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+            if not item:
+                raise HTTPException(404, "item")
+            active = c.execute(
+                "SELECT COUNT(*) c FROM loans WHERE item_id=? AND status='active'",
+                (iid,)).fetchone()["c"]
+            check = can_lend(item["status"], active)
+            if not check["ok"]:
+                raise HTTPException(409, check["reason"])
+            # 条件更新兜底叠单竞态：与撤销归还/另一笔借出并发时，
+            # 只有一方能把 available 翻成 on_loan，抢不到就整单不写。
+            flipped = c.execute(
+                "UPDATE items SET status='on_loan' WHERE id=? AND status='available'",
+                (iid,)).rowcount
+            if not flipped:
+                raise HTTPException(409, "item_not_available")
+            cur = c.execute(
+                "INSERT INTO loans(item_id,borrower,status,due_date,lent_at) VALUES (?,?,?,?,?)",
+                (iid, body.borrower, "active", body.due_date, datetime.now(timezone.utc).isoformat()))
+            c.commit()
+        except HTTPException:
+            c.rollback()
+            raise
+        except IntegrityError:
+            # 叠单竞态：唯一索引保证一物一在借，抢不到的一方整单不写
+            c.rollback()
+            raise HTTPException(409, "already_on_loan")
+        lid = cur.lastrowid
+        return {"loan_id": lid}
+    finally:
+        c.close()
 
 @app.post("/api/loans/{lid}/return")
 def return_loan(lid: int):
     c = connect()
-    loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
-    if not loan: c.close(); raise HTTPException(404, "loan")
-    if loan["status"] != "active":
-        c.close(); raise HTTPException(400, "not_active")
-    c.execute("UPDATE loans SET status='returned', returned_at=? WHERE id=?",
-              (datetime.now(timezone.utc).isoformat(), lid))
-    c.execute("UPDATE items SET status='available' WHERE id=?", (loan["item_id"],))
-    c.commit(); c.close(); return {"ok": True}
+    try:
+        try:
+            loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
+            if not loan:
+                raise HTTPException(404, "loan")
+            # 条件更新兜底叠单/重复提交：只有 active 的笔能被归还
+            flipped = c.execute(
+                "UPDATE loans SET status='returned', returned_at=? "
+                "WHERE id=? AND status='active'",
+                (datetime.now(timezone.utc).isoformat(), lid)).rowcount
+            if not flipped:
+                raise HTTPException(400, "not_active")
+            c.execute(
+                "UPDATE items SET status='available' WHERE id=? "
+                "AND NOT EXISTS(SELECT 1 FROM loans WHERE item_id=? AND status='active')",
+                (loan["item_id"], loan["item_id"]))
+            c.commit()
+        except HTTPException:
+            c.rollback()
+            raise
+        return {"ok": True}
+    finally:
+        c.close()
 
 class UnreturnIn(BaseModel):
     reason: str = ""
@@ -87,45 +124,58 @@ class UnreturnIn(BaseModel):
 def unreturn_loan(lid: int, body: UnreturnIn):
     reason = body.reason.strip() if isinstance(body.reason, str) else ""
     if not reason:
+        # 缺原因：不开事务、不碰集合
         raise HTTPException(400, "reason_required")
     c = connect()
     try:
-        loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
-        if not loan: raise HTTPException(404, "loan")
-        if loan["status"] != "returned": raise HTTPException(400, "not_returned")
-        # 只能撤销“最近一次成功 returned”：之后不得再有任何归还（全局最近一笔）
-        newer = c.execute(
-            "SELECT id FROM loans WHERE status='returned' AND id>?", (lid,)
-        ).fetchone()
-        if newer: raise HTTPException(409, "not_latest_return")
-        iid = loan["item_id"]
-        item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
-        active = c.execute(
-            "SELECT * FROM loans WHERE item_id=? AND status='active' ORDER BY id DESC",
-            (iid,)).fetchall()
-        conflict = len(active) > 0
-        if conflict and body.on_conflict == "fail":
-            ud.apply_fail_drift(c, iid)
-            raise HTTPException(409, "item_relent")
         bumped_ids = []
-        if conflict:
-            # bump：挤掉归还后被别人借出的在借笔（单笔或并发遗留也一并收口）
-            for n in active:
-                c.execute(
-                    "UPDATE loans SET status='cancelled', unreturn_reason=?, rev_conflict='bumped' "
-                    "WHERE id=?",
-                    (f"撤销归还#{lid} 挤掉新借：{reason}", n["id"]))
-                bumped_ids.append(n["id"])
+        try:
+            loan = c.execute("SELECT * FROM loans WHERE id=?", (lid,)).fetchone()
+            if not loan:
+                raise HTTPException(404, "loan")
+            if loan["status"] != "returned":
+                raise HTTPException(400, "not_returned")
+            # 只能撤销“最近一次成功 returned”：之后不得再有任何归还（全局最近一笔）
+            newer = c.execute(
+                "SELECT id FROM loans WHERE status='returned' AND id>?", (lid,)
+            ).fetchone()
+            if newer:
+                raise HTTPException(409, "not_latest_return")
+            iid = loan["item_id"]
+            item = c.execute("SELECT * FROM items WHERE id=?", (iid,)).fetchone()
+            if not item:
+                raise HTTPException(404, "item")
+            active = c.execute(
+                "SELECT * FROM loans WHERE item_id=? AND status='active' ORDER BY id DESC",
+                (iid,)).fetchall()
+            conflict = len(active) > 0
+            if conflict and body.on_conflict == "fail":
+                # 整单失败保持现况：一条都不写，回滚后直接回错
+                raise HTTPException(409, "item_relent")
+            now = datetime.now(timezone.utc).isoformat()
+            if conflict:
+                # bump：挤掉归还后被别人借出的在借笔（单笔或并发遗留也一并收口）
+                for n in active:
+                    c.execute(
+                        "UPDATE loans SET status='cancelled', unreturn_reason=?, rev_conflict='bumped' "
+                        "WHERE id=?",
+                        (f"撤销归还#{lid} 挤掉新借：{reason}", n["id"]))
+                    bumped_ids.append(n["id"])
+            # 原笔恢复 active、item 置 on_loan 必须同事务落地：
+            # 要么都成（在借栏出现、可借栏移除、顶细条一致），要么都不动。
+            c.execute(
+                "UPDATE loans SET status='active', returned_at=NULL, unreturned_at=?, "
+                "unreturn_reason=?, rev_conflict=? WHERE id=?",
+                (now, reason, "bump" if conflict else None, lid))
             c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-        else:
-            # 无冲突：item 必须确为 available（逾期扫只判 loan 行，不写 items.status）
-            c.execute("UPDATE items SET status='on_loan' WHERE id=?", (iid,))
-        c.execute(
-            "UPDATE loans SET status='active', returned_at=NULL, unreturned_at=?, "
-            "unreturn_reason=?, rev_conflict=? WHERE id=?",
-            (datetime.now(timezone.utc).isoformat(), reason,
-             "bump" if conflict else None, lid))
-        c.commit()
+            c.commit()
+        except HTTPException:
+            c.rollback()
+            raise
+        except IntegrityError:
+            # 叠单竞态：该物已有在借笔（唯一索引兜底），整单回滚
+            c.rollback()
+            raise HTTPException(409, "item_relent")
         return {"ok": True, "conflict": conflict, "bumped_loan_ids": bumped_ids}
     finally:
         c.close()
